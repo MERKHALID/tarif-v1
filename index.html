@@ -100,19 +100,23 @@
             const [loginError, setLoginError] = useState('');
             const [syncStatus, setSyncStatus] = useState(null); 
             const [syncLog, setSyncLog] = useState('');
-            const fileInputRef = useRef(null); // Pour l'import de config
+            const fileInputRef = useRef(null); 
 
             // --- CHARGEMENT PERSISTANCE ---
             useEffect(() => {
-                const savedTarifs = localStorage.getItem('cmgp_dbx_tarifs');
-                const savedFT = localStorage.getItem('cmgp_dbx_ft');
-                const savedConfig = localStorage.getItem('cmgp_dbx_config');
-                const savedSync = localStorage.getItem('cmgp_dbx_sync_info');
+                try {
+                    const savedTarifs = localStorage.getItem('cmgp_dbx_tarifs');
+                    const savedFT = localStorage.getItem('cmgp_dbx_ft');
+                    const savedConfig = localStorage.getItem('cmgp_dbx_config');
+                    const savedSync = localStorage.getItem('cmgp_dbx_sync_info');
 
-                if (savedTarifs) setTarifs(JSON.parse(savedTarifs));
-                if (savedFT) setFichesTechniques(JSON.parse(savedFT));
-                if (savedConfig) setDbxConfig(JSON.parse(savedConfig));
-                if (savedSync) setSyncInfo(JSON.parse(savedSync));
+                    if (savedTarifs) setTarifs(JSON.parse(savedTarifs));
+                    if (savedFT) setFichesTechniques(JSON.parse(savedFT));
+                    if (savedConfig) setDbxConfig(JSON.parse(savedConfig));
+                    if (savedSync) setSyncInfo(JSON.parse(savedSync));
+                } catch(e) {
+                    console.error("Erreur chargement localStorage", e);
+                }
             }, []);
 
             useEffect(() => { localStorage.setItem('cmgp_dbx_tarifs', JSON.stringify(tarifs)); }, [tarifs]);
@@ -122,21 +126,12 @@
 
             // --- FONCTIONS SAUVEGARDE / RESTAURATION ---
             const handleExportConfig = () => {
-                const data = {
-                    tarifs,
-                    fichesTechniques,
-                    dbxConfig,
-                    syncInfo,
-                    exportDate: new Date().toISOString()
-                };
+                const data = { tarifs, fichesTechniques, dbxConfig, syncInfo, exportDate: new Date().toISOString() };
                 const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
-                a.href = url;
-                a.download = `cmgp_config_backup_${new Date().toISOString().slice(0,10)}.json`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
+                a.href = url; a.download = `cmgp_config_backup_${new Date().toISOString().slice(0,10)}.json`;
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
             };
 
             const handleImportConfig = (event) => {
@@ -150,21 +145,20 @@
                         if (data.fichesTechniques) setFichesTechniques(data.fichesTechniques);
                         if (data.dbxConfig) setDbxConfig(data.dbxConfig);
                         if (data.syncInfo) setSyncInfo(data.syncInfo);
-                        alert("Configuration et données restaurées avec succès !");
-                    } catch (error) {
-                        alert("Erreur lors de la lecture du fichier de sauvegarde.");
-                    }
+                        alert("Configuration restaurée !");
+                    } catch (error) { alert("Fichier invalide."); }
                 };
                 reader.readAsText(file);
             };
 
-            // --- LOGIQUE METIER IA & PARSING ---
+            // --- LOGIQUE METIER IA & PARSING (CORRIGÉE) ---
             const analyzeTarifPDF = async (blob) => {
                 try {
                     const arrayBuffer = await blob.arrayBuffer();
                     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
                     let allProducts = [];
-                    // Limite à 2 pages pour la vitesse
+                    
+                    // On analyse les 2 premières pages
                     for (let i = 1; i <= Math.min(pdf.numPages, 2); i++) {
                         const page = await pdf.getPage(i);
                         const viewport = page.getViewport({ scale: 1.5 });
@@ -174,24 +168,34 @@
                         canvas.width = viewport.width;
                         await page.render({ canvasContext: ctx, viewport }).promise;
                         
-                        // Appel IA
+                        // Appel IA avec prompt strict
                         const result = await callIA({
-                            contents: [{ parts: [{ text: "Extrais produits, prix HT, format. JSON uniquement: { 'products': [ { 'name': '...', 'price': '...', 'packaging': '...' } ] }" }, { inlineData: { mimeType: "image/png", data: canvas.toDataURL('image/png').split(',')[1] } } ] }],
+                            contents: [{ parts: [{ text: "Extrais la liste des produits sous forme d'un objet JSON strict. Structure: { \"products\": [ { \"name\": \"Nom complet\", \"price\": \"Prix numérique (ex: 120.50)\", \"packaging\": \"Unité (ex: 25 KG)\" } ] }. Ne mets RIEN d'autre que le JSON." }, { inlineData: { mimeType: "image/png", data: canvas.toDataURL('image/png').split(',')[1] } } ] }],
                             generationConfig: { responseMimeType: "application/json" }
                         });
                         
                         if (result.candidates && result.candidates[0].content) {
                             let text = result.candidates[0].content.parts[0].text;
-                            // NETTOYAGE : Suppression des balises Markdown ```json et ```
-                            text = text.replace(/```json/g, '').replace(/```/g, '').trim();
                             
-                            try {
-                                const data = JSON.parse(text);
-                                if (data.products && Array.isArray(data.products)) {
-                                    allProducts.push(...data.products);
+                            // NETTOYAGE ROBUSTE : Trouver le premier '{' et le dernier '}'
+                            const firstBrace = text.indexOf('{');
+                            const lastBrace = text.lastIndexOf('}');
+                            
+                            if (firstBrace !== -1 && lastBrace !== -1) {
+                                const jsonStr = text.substring(firstBrace, lastBrace + 1);
+                                try {
+                                    const data = JSON.parse(jsonStr);
+                                    if (data.products && Array.isArray(data.products)) {
+                                        // Nettoyage des prix (convertir en nombre si string)
+                                        const cleanProducts = data.products.map(p => ({
+                                            ...p,
+                                            price: typeof p.price === 'string' ? p.price.replace(',', '.') : p.price
+                                        }));
+                                        allProducts.push(...cleanProducts);
+                                    }
+                                } catch(jsonErr) {
+                                    console.warn("Erreur JSON après nettoyage:", jsonStr);
                                 }
-                            } catch(jsonErr) {
-                                console.warn("Erreur structure JSON brute:", text);
                             }
                         }
                     }
@@ -203,13 +207,12 @@
             };
 
             const analyzeFTName = async (blob, filename) => {
-                let name = filename.replace(/\.pdf$/i, '').replace(/_/g, ' ');
-                return name;
+                return filename.replace(/\.pdf$/i, '').replace(/_/g, ' ');
             };
 
             // --- MOTEUR DE SYNC DROPBOX ---
             const runSync = async () => {
-                if (!dbxConfig.token) return alert("Veuillez configurer le Token Dropbox dans l'onglet Config.");
+                if (!dbxConfig.token) return alert("Configurez le Token Dropbox d'abord.");
                 
                 setSyncStatus('loading');
                 setSyncLog('Démarrage synchronisation...');
@@ -217,11 +220,10 @@
                 let updatesCount = 0;
 
                 try {
-                    // 1. SYNC TARIFS (Avec protection boucle)
+                    // 1. SYNC TARIFS
                     setSyncLog(`>>> Analyse Tarifs (${dbxConfig.pathTarifs})`);
                     try {
                         const listTarifs = await dbxListFolder(dbxConfig.token, dbxConfig.pathTarifs);
-                        const currentTarifIds = tarifs.map(t => t.id);
                         const validEntryIds = [];
 
                         for (const entry of listTarifs.entries) {
@@ -230,27 +232,20 @@
                             validEntryIds.push(entry.id);
                             const existing = tarifs.find(t => t.id === entry.id);
 
-                            // CONDITION DE MISE A JOUR : Nouveau ou Date modifiée
-                            // NOTE: On peut forcer la réanalyse si existing.products.length === 0 pour corriger les erreurs passées
-                            const needsUpdate = !existing || existing.server_modified !== entry.server_modified || (existing.products && existing.products.length === 0);
+                            // Force update si pas de produits trouvés précédemment
+                            const needsUpdate = !existing || existing.server_modified !== entry.server_modified || (!existing.products || existing.products.length === 0);
 
                             if (needsUpdate) {
-                                setSyncLog(`Traitement : ${entry.name}...`);
-                                
+                                setSyncLog(`Traitement IA : ${entry.name}...`);
                                 try {
-                                    // Téléchargement
                                     const blob = await dbxDownloadFile(dbxConfig.token, entry.path_lower);
-                                    
-                                    // Pause anti-spam IA (1.5 secondes)
-                                    await delay(1500); 
-
-                                    // Analyse IA
+                                    await delay(2000); // Pause 2s pour l'IA
                                     const products = await analyzeTarifPDF(blob);
                                     
                                     if (products.length === 0) {
-                                        setSyncLog(`⚠️ 0 produits trouvés dans ${entry.name}. Vérifiez le format.`);
+                                        setSyncLog(⚠️ AVERTISSEMENT: 0 produits trouvés dans ${entry.name}.`);
                                     } else {
-                                        setSyncLog(`✅ ${products.length} produits extraits de ${entry.name}`);
+                                        setSyncLog(`✅ SUCCÈS: ${products.length} produits extraits de ${entry.name}`);
                                     }
 
                                     const newDoc = {
@@ -262,24 +257,30 @@
                                         type: 'tarif'
                                     };
                                     
-                                    setTarifs(prev => [...prev.filter(p => p.id !== entry.id), newDoc]);
+                                    setTarifs(prev => {
+                                        // On remplace l'ancien s'il existe
+                                        const filtered = prev.filter(p => p.id !== entry.id);
+                                        return [...filtered, newDoc];
+                                    });
                                     newRecentFiles.push({ name: entry.name, type: 'tarif', date: new Date().toLocaleTimeString() });
                                     updatesCount++;
 
                                 } catch (fileError) {
                                     setSyncLog(`❌ ÉCHEC fichier ${entry.name} : ${fileError.message}`);
                                 }
+                            } else {
+                                // setSyncLog(`Déjà à jour : ${entry.name}`);
                             }
                         }
-                        // Nettoyage des orphelins (fichiers supprimés de Dropbox)
+                        // Nettoyage orphelins
                         setTarifs(prev => prev.filter(t => validEntryIds.includes(t.id)));
 
                     } catch (e) {
-                        console.error("Erreur Sync Tarifs", e);
-                        setSyncLog("Erreur critique sur dossier Tarifs : " + e.message);
+                        console.error(e);
+                        setSyncLog(`Erreur dossier Tarifs: ${e.message}`);
                     }
 
-                    // 2. SYNC FICHES TECHNIQUES
+                    // 2. SYNC FICHES
                     setSyncLog(`>>> Analyse Fiches (${dbxConfig.pathFT})`);
                     try {
                         const listFT = await dbxListFolder(dbxConfig.token, dbxConfig.pathFT);
@@ -287,14 +288,12 @@
 
                         for (const entry of listFT.entries) {
                             if (entry['.tag'] !== 'file') continue;
-                            
                             validFTIds.push(entry.id);
                             const existing = fichesTechniques.find(f => f.id === entry.id);
 
                             if (!existing || existing.server_modified !== entry.server_modified) {
                                 setSyncLog(`Indexation : ${entry.name}`);
                                 const productName = await analyzeFTName(null, entry.name);
-
                                 const newDoc = {
                                     id: entry.id,
                                     fileName: entry.name,
@@ -303,17 +302,14 @@
                                     server_modified: entry.server_modified,
                                     type: 'ft'
                                 };
-
                                 setFichesTechniques(prev => [...prev.filter(f => f.id !== entry.id), newDoc]);
                                 newRecentFiles.push({ name: entry.name, type: 'ft', date: new Date().toLocaleTimeString() });
                                 updatesCount++;
                             }
                         }
                         setFichesTechniques(prev => prev.filter(f => validFTIds.includes(f.id)));
-
                     } catch (e) {
-                        console.error("Erreur Sync FT", e);
-                        setSyncLog("Erreur dossier FT (Vérifiez le chemin).");
+                        setSyncLog(`Erreur dossier Fiches: ${e.message}`);
                     }
 
                     setSyncInfo({
@@ -321,12 +317,11 @@
                         recentFiles: [...newRecentFiles, ...syncInfo.recentFiles].slice(0, 10)
                     });
                     setSyncStatus('success');
-                    setSyncLog(`Terminé ! ${updatesCount} fichier(s) traité(s).`);
+                    setSyncLog(`Terminé ! ${updatesCount} mise(s) à jour.`);
 
                 } catch (globalError) {
-                    console.error(globalError);
                     setSyncStatus('error');
-                    setSyncLog("Erreur générale : " + globalError.message);
+                    setSyncLog("Erreur critique : " + globalError.message);
                 }
             };
 
@@ -355,12 +350,15 @@
                 }
             };
 
+            // --- RECHERCHE ---
             const searchResults = useMemo(() => {
                 if (queryStr.length < 2) return [];
                 const res = [];
                 tarifs.forEach(t => {
+                    // Sécurité : on vérifie que t.products est bien un tableau
                     (t.products || []).forEach(p => {
-                        if (String(p.name).toLowerCase().includes(queryStr.toLowerCase())) {
+                        // Sécurité : on vérifie que p.name existe avant le toLowerCase
+                        if (p.name && String(p.name).toLowerCase().includes(queryStr.toLowerCase())) {
                             res.push({ ...p, source: t.name, path: t.path, sourceId: t.id });
                         }
                     });
@@ -371,8 +369,8 @@
             const ftSearchResults = useMemo(() => {
                 if (ftQueryStr.length < 2) return [];
                 return fichesTechniques.filter(ft => 
-                    (ft.productName || "").toLowerCase().includes(ftQueryStr.toLowerCase()) || 
-                    (ft.fileName || "").toLowerCase().includes(ftQueryStr.toLowerCase())
+                    (ft.productName && ft.productName.toLowerCase().includes(ftQueryStr.toLowerCase())) || 
+                    (ft.fileName && ft.fileName.toLowerCase().includes(ftQueryStr.toLowerCase()))
                 );
             }, [ftQueryStr, fichesTechniques]);
 
@@ -386,14 +384,8 @@
                         </div>
                         <form onSubmit={handleLogin} className="p-8 space-y-4">
                             {loginError && <div className="bg-red-50 text-red-600 p-3 rounded-lg text-xs font-bold text-center">{loginError}</div>}
-                            <div>
-                                <label className="text-xs font-bold text-slate-400 uppercase ml-1">Utilisateur</label>
-                                <input className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" value={loginForm.username} onChange={e => setLoginForm({...loginForm, username: e.target.value})} />
-                            </div>
-                            <div>
-                                <label className="text-xs font-bold text-slate-400 uppercase ml-1">Mot de passe</label>
-                                <input type="password" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" value={loginForm.password} onChange={e => setLoginForm({...loginForm, password: e.target.value})} />
-                            </div>
+                            <div><label className="text-xs font-bold text-slate-400 uppercase ml-1">Utilisateur</label><input className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" value={loginForm.username} onChange={e => setLoginForm({...loginForm, username: e.target.value})} /></div>
+                            <div><label className="text-xs font-bold text-slate-400 uppercase ml-1">Mot de passe</label><input type="password" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" value={loginForm.password} onChange={e => setLoginForm({...loginForm, password: e.target.value})} /></div>
                             <button className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl shadow-lg hover:bg-slate-800 transition-transform active:scale-95">SE CONNECTER</button>
                         </form>
                     </div>
@@ -424,15 +416,35 @@
                                 {searchTab === 'tarifs' && (
                                     <div className="max-w-2xl mx-auto">
                                         <div className="relative mb-8 group"><div className="absolute inset-y-0 left-4 flex items-center pointer-events-none text-slate-300 group-focus-within:text-blue-500 transition-colors"><Icon name="Search" size={20}/></div><input className="w-full pl-12 pr-4 py-4 bg-white border border-slate-200 rounded-2xl shadow-sm focus:ring-4 focus:ring-blue-50 outline-none text-lg transition-all placeholder:text-slate-300" placeholder="Rechercher un prix (ex: Pompe X200)..." value={queryStr} onChange={e => setQueryStr(e.target.value)}/></div>
-                                        <div className="space-y-3">{searchResults.map((p, i) => (<div key={i} className="bg-white p-4 rounded-xl border border-slate-100 hover:border-blue-300 hover:shadow-md transition-all group flex items-center justify-between cursor-default"><div className="flex items-center gap-4"><div className="w-10 h-10 bg-blue-50 text-blue-600 rounded-lg flex items-center justify-center font-bold text-lg">{p.name.charAt(0).toUpperCase()}</div><div><div className="font-bold text-slate-800">{p.name}</div><div className="text-xs text-slate-400 font-medium flex items-center gap-1"><Icon name="Box" size={10}/> {p.packaging} • <span className="text-blue-400">{p.source}</span></div></div></div><div className="text-right"><div className="text-xl font-black text-slate-800">{p.price} <span className="text-xs font-bold text-slate-400">DH</span></div><button onClick={() => openDropboxFile(p.path)} className="text-[10px] font-bold text-blue-600 hover:underline mt-1 flex items-center justify-end gap-1">Voir Source <Icon name="ExternalLink" size={10}/></button></div></div>))}{searchResults.length === 0 && queryStr.length > 1 && (<div className="text-center py-12 text-slate-400"><Icon name="Ghost" size={32} className="mx-auto mb-2 opacity-50"/><p>Aucun produit trouvé dans les tarifs synchronisés.</p></div>)}</div>
+                                        <div className="space-y-3">
+                                            {searchResults.length > 0 ? searchResults.map((p, i) => (
+                                                <div key={i} className="bg-white p-4 rounded-xl border border-slate-100 hover:border-blue-300 hover:shadow-md transition-all group flex items-center justify-between cursor-default">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className="w-10 h-10 bg-blue-50 text-blue-600 rounded-lg flex items-center justify-center font-bold text-lg">{p.name ? p.name.charAt(0).toUpperCase() : '?'}</div>
+                                                        <div><div className="font-bold text-slate-800">{p.name}</div><div className="text-xs text-slate-400 font-medium flex items-center gap-1"><Icon name="Box" size={10}/> {p.packaging} • <span className="text-blue-400">{p.source}</span></div></div>
+                                                    </div>
+                                                    <div className="text-right"><div className="text-xl font-black text-slate-800">{p.price} <span className="text-xs font-bold text-slate-400">DH</span></div><button onClick={() => openDropboxFile(p.path)} className="text-[10px] font-bold text-blue-600 hover:underline mt-1 flex items-center justify-end gap-1">Voir Source <Icon name="ExternalLink" size={10}/></button></div>
+                                                </div>
+                                            )) : (
+                                                queryStr.length > 1 && <div className="text-center py-12 text-slate-400"><Icon name="Ghost" size={32} className="mx-auto mb-2 opacity-50"/><p>Aucun produit trouvé.</p></div>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
 
                                 {searchTab === 'ft' && (
                                     <div className="max-w-2xl mx-auto">
                                         <div className="relative mb-8 group"><div className="absolute inset-y-0 left-4 flex items-center pointer-events-none text-slate-300 group-focus-within:text-indigo-500 transition-colors"><Icon name="Search" size={20}/></div><input className="w-full pl-12 pr-4 py-4 bg-white border border-slate-200 rounded-2xl shadow-sm focus:ring-4 focus:ring-indigo-50 outline-none text-lg transition-all placeholder:text-slate-300" placeholder="Rechercher une fiche technique..." value={ftQueryStr} onChange={e => setFtQueryStr(e.target.value)}/></div>
-                                        <div className="grid grid-cols-2 gap-4">{ftSearchResults.map((ft, i) => (<div key={i} onClick={() => openDropboxFile(ft.path)} className="bg-white p-4 rounded-xl border border-slate-100 hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group"><div className="flex items-start justify-between mb-3"><div className="p-2 bg-indigo-50 text-indigo-600 rounded-lg"><Icon name="FileText" size={20}/></div><span className="text-[10px] font-mono text-slate-400 bg-slate-50 px-2 py-1 rounded">PDF</span></div><h3 className="font-bold text-slate-700 group-hover:text-indigo-600 transition-colors line-clamp-2">{ft.productName}</h3><p className="text-xs text-slate-400 mt-1 truncate">{ft.fileName}</p></div>))}</div>
-                                        {ftSearchResults.length === 0 && ftQueryStr.length > 1 && <p className="text-center py-12 text-slate-400">Aucune fiche trouvée sur Dropbox.</p>}
+                                        <div className="grid grid-cols-2 gap-4">
+                                            {ftSearchResults.length > 0 ? ftSearchResults.map((ft, i) => (
+                                                <div key={i} onClick={() => openDropboxFile(ft.path)} className="bg-white p-4 rounded-xl border border-slate-100 hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group">
+                                                    <div className="flex items-start justify-between mb-3"><div className="p-2 bg-indigo-50 text-indigo-600 rounded-lg"><Icon name="FileText" size={20}/></div><span className="text-[10px] font-mono text-slate-400 bg-slate-50 px-2 py-1 rounded">PDF</span></div>
+                                                    <h3 className="font-bold text-slate-700 group-hover:text-indigo-600 transition-colors line-clamp-2">{ft.productName}</h3><p className="text-xs text-slate-400 mt-1 truncate">{ft.fileName}</p>
+                                                </div>
+                                            )) : (
+                                                ftQueryStr.length > 1 && <div className="col-span-2 text-center py-12 text-slate-400">Aucune fiche trouvée.</div>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
                             </div>
@@ -441,11 +453,7 @@
                         {view === 'admin' && (
                             <div className="animate-fade">
                                 <div className="bg-white rounded-3xl p-8 border border-slate-200 shadow-sm">
-                                    <div className="flex items-center gap-4 mb-8">
-                                        <div className="bg-blue-600 text-white p-3 rounded-xl"><Icon name="Cloud" size={24}/></div>
-                                        <div><h2 className="text-xl font-bold text-slate-800">Centre de Synchronisation</h2><p className="text-sm text-slate-500">Gérez la connexion avec Dropbox</p></div>
-                                    </div>
-
+                                    <div className="flex items-center gap-4 mb-8"><div className="bg-blue-600 text-white p-3 rounded-xl"><Icon name="Cloud" size={24}/></div><div><h2 className="text-xl font-bold text-slate-800">Centre de Synchronisation</h2><p className="text-sm text-slate-500">Gérez la connexion avec Dropbox</p></div></div>
                                     <div className="flex gap-4 mb-6 border-b border-slate-100 pb-1">
                                         <button onClick={() => setAdminTab('sync')} className={`pb-3 px-2 text-sm font-bold border-b-2 transition-colors ${adminTab === 'sync' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>État & Sync</button>
                                         <button onClick={() => setAdminTab('config')} className={`pb-3 px-2 text-sm font-bold border-b-2 transition-colors ${adminTab === 'config' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>Configuration</button>
@@ -457,36 +465,14 @@
                                                 <div><div className="text-xs font-bold text-slate-400 uppercase mb-1">Dernière mise à jour</div><div className="text-lg font-bold text-slate-800 flex items-center gap-2"><Icon name="Clock" size={18} className="text-slate-400"/>{syncInfo.lastSync || "Jamais"}</div><div className="text-xs text-slate-500 mt-2">{tarifs.length} tarifs • {fichesTechniques.length} fiches indexées</div></div>
                                                 <button onClick={runSync} disabled={syncStatus === 'loading'} className={`px-6 py-3 rounded-xl font-bold text-white shadow-lg flex items-center gap-2 transition-all ${syncStatus === 'loading' ? 'bg-slate-400 cursor-wait' : 'bg-blue-600 hover:bg-blue-700 active:scale-95'}`}><Icon name={syncStatus === 'loading' ? 'Loader2' : 'RefreshCw'} className={syncStatus === 'loading' ? 'animate-spin' : ''}/>{syncStatus === 'loading' ? 'Scan en cours...' : 'Synchroniser Maintenant'}</button>
                                             </div>
-                                            <div className="bg-slate-900 rounded-xl p-4 font-mono text-xs text-green-400 h-48 overflow-y-auto">
-                                                <div className="opacity-50 mb-2"># Console de synchronisation Dropbox...</div>
-                                                {syncLog && <div className="whitespace-pre-line">> {syncLog}</div>}
-                                            </div>
+                                            <div className="bg-slate-900 rounded-xl p-4 font-mono text-xs text-green-400 h-48 overflow-y-auto"><div className="opacity-50 mb-2"># Console de synchronisation Dropbox...</div>{syncLog && <div className="whitespace-pre-line">> {syncLog}</div>}</div>
                                         </div>
                                     )}
 
                                     {adminTab === 'config' && (
                                         <div className="space-y-6 max-w-lg">
-                                            <div className="bg-yellow-50 text-yellow-800 p-4 rounded-xl text-xs border border-yellow-100 leading-relaxed">
-                                                <strong className="block mb-1">Comment obtenir le Token ?</strong>
-                                                1. Allez sur <a href="https://www.dropbox.com/developers/apps" target="_blank" className="underline font-bold">Dropbox Developers</a>.<br/>
-                                                2. Créez une app ("Scoped access", "Full Dropbox").<br/>
-                                                3. Dans l'onglet "Permissions", cochez <code>files.content.read</code>.<br/>
-                                                4. Dans l'onglet "Settings", générez un "Generated Access Token".
-                                            </div>
-                                            
-                                            {/* Zone Export / Import pour migration */}
-                                            <div className="bg-blue-50 text-blue-900 p-4 rounded-xl text-xs border border-blue-100 flex justify-between items-center">
-                                                <div>
-                                                    <strong className="block">Sauvegarder / Restaurer</strong>
-                                                    <span className="opacity-75">Pour migrer vers un autre hébergement (ou Local)</span>
-                                                </div>
-                                                <div className="flex gap-2">
-                                                    <button onClick={handleExportConfig} className="bg-white border border-blue-200 text-blue-600 px-3 py-1.5 rounded-lg hover:bg-blue-50 font-bold shadow-sm flex items-center gap-1"><Icon name="Download" size={14}/> Exporter</button>
-                                                    <button onClick={() => fileInputRef.current.click()} className="bg-blue-600 text-white px-3 py-1.5 rounded-lg hover:bg-blue-700 font-bold shadow-sm flex items-center gap-1"><Icon name="Upload" size={14}/> Importer</button>
-                                                    <input type="file" ref={fileInputRef} className="hidden" accept=".json" onChange={handleImportConfig} />
-                                                </div>
-                                            </div>
-
+                                            <div className="bg-yellow-50 text-yellow-800 p-4 rounded-xl text-xs border border-yellow-100 leading-relaxed"><strong className="block mb-1">Comment obtenir le Token ?</strong>1. Allez sur <a href="https://www.dropbox.com/developers/apps" target="_blank" className="underline font-bold">Dropbox Developers</a>.<br/>2. Créez une app ("Scoped access", "Full Dropbox").<br/>3. Dans l'onglet "Permissions", cochez <code>files.content.read</code>.<br/>4. Dans l'onglet "Settings", générez un "Generated Access Token".</div>
+                                            <div className="bg-blue-50 text-blue-900 p-4 rounded-xl text-xs border border-blue-100 flex justify-between items-center"><div><strong className="block">Sauvegarder / Restaurer</strong><span className="opacity-75">Pour migrer vers un autre hébergement (ou Local)</span></div><div className="flex gap-2"><button onClick={handleExportConfig} className="bg-white border border-blue-200 text-blue-600 px-3 py-1.5 rounded-lg hover:bg-blue-50 font-bold shadow-sm flex items-center gap-1"><Icon name="Download" size={14}/> Exporter</button><button onClick={() => fileInputRef.current.click()} className="bg-blue-600 text-white px-3 py-1.5 rounded-lg hover:bg-blue-700 font-bold shadow-sm flex items-center gap-1"><Icon name="Upload" size={14}/> Importer</button><input type="file" ref={fileInputRef} className="hidden" accept=".json" onChange={handleImportConfig} /></div></div>
                                             <div><label className="block text-xs font-bold text-slate-500 uppercase mb-2">Token d'Accès Dropbox</label><input type="password" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm" placeholder="sl.BHz..." value={dbxConfig.token} onChange={e => setDbxConfig({...dbxConfig, token: e.target.value})}/></div>
                                             <div className="grid grid-cols-2 gap-4"><div><label className="block text-xs font-bold text-slate-500 uppercase mb-2">Dossier Tarifs</label><input className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm" placeholder="/Tarifs" value={dbxConfig.pathTarifs} onChange={e => setDbxConfig({...dbxConfig, pathTarifs: e.target.value})}/></div><div><label className="block text-xs font-bold text-slate-500 uppercase mb-2">Dossier Fiches</label><input className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm" placeholder="/Fiches" value={dbxConfig.pathFT} onChange={e => setDbxConfig({...dbxConfig, pathFT: e.target.value})}/></div></div>
                                             <div className="pt-4"><button onClick={() => { alert('Configuration sauvegardée !'); setAdminTab('sync'); }} className="bg-slate-800 text-white px-6 py-3 rounded-xl font-bold text-sm hover:bg-slate-900">Sauvegarder</button></div>
