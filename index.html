@@ -145,7 +145,15 @@
                     }
                     
                     // 3. Autres erreurs ou succès
-                    if (!res.ok) throw new Error(await res.text());
+                    if (!res.ok) {
+                        const errorText = await res.text();
+                        // DÉTECTION INTELLIGENTE DE L'ERREUR D'EXPIRATION
+                        // Si le token est expiré et qu'on n'a pas pu le rafraîchir (pas de refresh token sur ce device)
+                        if (errorText.includes("expired_access_token")) {
+                            throw new Error("⚠️ Session expirée sur cet appareil. Le Token Dropbox est invalide. Veuillez vous reconnecter en Admin > Paramètres pour rétablir l'accès.");
+                        }
+                        throw new Error(errorText);
+                    }
                     return res;
 
                 } catch (err) {
