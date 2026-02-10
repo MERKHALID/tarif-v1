@@ -243,11 +243,30 @@
             } catch (e) { throw e; }
         };
 
+        // Extraction JSON améliorée pour gérer Arrays et Objets
         const extractJSON = (text) => {
-            const firstBrace = text.indexOf('{');
-            const lastBrace = text.lastIndexOf('}');
-            if (firstBrace !== -1 && lastBrace !== -1) return text.substring(firstBrace, lastBrace + 1);
-            return text;
+            // Nettoyage basique des balises markdown
+            let clean = text.replace(/```json/g, '').replace(/```/g, '');
+            
+            const startBrace = clean.indexOf('{');
+            const startBracket = clean.indexOf('[');
+            
+            // Si aucun JSON détecté
+            if (startBrace === -1 && startBracket === -1) return clean;
+            
+            // Priorité à l'objet si présent en premier ou si pas de tableau
+            if (startBrace !== -1 && (startBracket === -1 || startBrace < startBracket)) {
+                const endBrace = clean.lastIndexOf('}');
+                if (endBrace !== -1) return clean.substring(startBrace, endBrace + 1);
+            }
+            
+            // Sinon priorité au tableau
+            if (startBracket !== -1 && (startBrace === -1 || startBracket < startBrace)) {
+                const endBracket = clean.lastIndexOf(']');
+                if (endBracket !== -1) return clean.substring(startBracket, endBracket + 1);
+            }
+            
+            return clean;
         };
 
         const extractDateFromFilename = (filename) => {
@@ -1345,11 +1364,11 @@
                     let allProducts = [];
                     let extractedDate = "Non daté";
                     const filenameDate = extractDateFromFilename(filename);
-                    const maxPages = Math.min(pdf.numPages, 20); // Augmenté la limite de pages
+                    const maxPages = Math.min(pdf.numPages, 50); // Augmentation limite pages pour être sûr
                     
                     for (let i = 1; i <= maxPages; i++) {
-                        // Feedback console pour debug
-                        console.log(`Analyse page ${i}/${maxPages}...`);
+                        // Feedback visuel pour l'utilisateur
+                        setSyncLog(`Analyse page ${i}/${pdf.numPages}...`);
                         
                         const page = await pdf.getPage(i);
                         const viewport = page.getViewport({ scale: 1.5 });
@@ -1360,18 +1379,22 @@
                         await page.render({ canvasContext: ctx, viewport }).promise;
                         const base64Img = canvas.toDataURL('image/png').split(',')[1];
                         
-                        const instructionPrix = "ATTENTION : Les prix sur le document utilisent le format EUROPEEN (ex: 1.000,00 = mille). Le POINT (.) est un séparateur de milliers et la VIRGULE (,) est la décimale. DANS LE JSON, convertis ces prix en NOMBRE FLOTTANT STANDARD (ex: 1000.00, sans séparateur de milliers).";
+                        const instructionPrix = "ATTENTION : Les prix sont au format EUROPEEN (ex: 1.000,00). Convertis en FLOAT (ex: 1000.00).";
                         
+                        // Prompt optimisé pour la stabilité JSON
                         let prompt = i === 1 
-                            ? `Analyse page ${i}. Cherche date (format JJ/MM/AAAA) sinon "${filenameDate}". ${instructionPrix} IMPORTANT: 1. Si un produit a un astérisque (*) avant ou après son nom, GARDE-LE dans le champ "name". 2. CRITIQUE : Le conditionnement (ex: 25Kg, 5L, Sac, Pot, Bidon, 1L) DOIT être extrait dans le champ 'packaging'. Si un produit existe en plusieurs tailles, génère plusieurs entrées distinctes. Format JSON STRICT requis: { "date_tarif": "...", "products": [ {"name": "...", "price": 0.00, "unit": "...", "packaging": "..."} ] }` 
-                            : `Analyse page ${i}. ${instructionPrix} IMPORTANT: 1. Astérisque (*) dans "name". 2. CRITIQUE : Extrais le conditionnement (ex: 25Kg, 5L, Sac, Pot) dans le champ 'packaging'. C'est ce qui différencie les produits. Format JSON STRICT requis: { "products": [ {"name": "...", "price": 0.00, "unit": "...", "packaging": "..."} ] }`;
+                            ? `Analyse page ${i}. Date (JJ/MM/AAAA) ou "${filenameDate}". ${instructionPrix} IMPORTANT: 1. Garde les astérisques (*) dans 'name'. 2. Extrais 'packaging' (ex: 25Kg, 5L, Sac, Pot, Bidon, 1L). JSON STRICT: { "date_tarif": "...", "products": [ {"name": "...", "price": 0.00, "unit": "...", "packaging": "..."} ] }` 
+                            : `Analyse page ${i}. ${instructionPrix} IMPORTANT: 1. Garde les astérisques (*) dans 'name'. 2. Extrais 'packaging'. JSON STRICT: { "products": [ {"name": "...", "price": 0.00, "unit": "...", "packaging": "..."} ] }`;
                         
-                        if (i > 1) await delay(2500); // Pause plus longue entre les pages
+                        if (i > 1) await delay(3000); // Délai augmenté pour éviter rate limit
                         
                         try {
                             const result = await callIA({ contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Img } } ] }], generationConfig: { responseMimeType: "application/json" } }, dbxConfig.geminiKey);
                             const textRaw = result.candidates[0].content.parts[0].text;
-                            const pageData = JSON.parse(extractJSON(textRaw));
+                            
+                            // Extraction plus robuste
+                            const jsonStr = extractJSON(textRaw);
+                            const pageData = JSON.parse(jsonStr);
                             
                             if (i === 1 && pageData.date_tarif) extractedDate = pageData.date_tarif;
                             
@@ -1383,6 +1406,7 @@
                             }
                         } catch (pageErr) { 
                             console.warn(`Erreur page ${i}:`, pageErr);
+                            // On continue même si une page échoue
                         }
                     }
                     return { date_tarif: extractedDate, products: allProducts };
@@ -2110,188 +2134,6 @@
                                                 <h3 className="text-sm font-bold uppercase text-slate-400 mb-4 pl-2 flex items-center gap-2 border-t pt-6 mt-6 md:border-none md:pt-0 md:mt-0"><Icon name="FileText" size={16}/> Fiches ({(searchResults.fiches || []).length})</h3>
                                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                                     {(searchResults.fiches || []).map((f, i) => (<div key={i} className="bg-white p-4 rounded-2xl border border-slate-100 hover:border-indigo-300 hover:shadow-md transition-all flex items-center justify-between group"><div className="flex items-center gap-3"><div className="w-10 h-10 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0"><Icon name="FileText" size={20}/></div><div className="truncate pr-4"><div className="font-bold text-slate-700 truncate">{f.name}</div><div className="text-xs text-slate-400">PDF</div></div></div><button onClick={() => openFile(f.path, f.name)} className="p-2 text-slate-400 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50 rounded-lg transition-colors"><Icon name="Eye" size={18}/></button></div>))}
-                                                </div>
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-                            )}
-
-                            {activeTab === 'quote' && (
-                                <div className="max-w-4xl mx-auto space-y-8 animate-fade">
-                                    {/* ... QUOTE TAB CONTENT (KEPT AS IS) ... */}
-                                    <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
-                                        <div className="flex justify-between items-center mb-6">
-                                            <h3 className="font-bold text-lg flex items-center gap-2"><Icon name="FileEdit" /> Créer un Devis</h3>
-                                            <div className="flex gap-2">
-                                                {currentUser?.role === 'admin' && (
-                                                    <>
-                                                        <button onClick={() => setShowSavedQuotesModal(true)} className="bg-blue-50 text-blue-600 px-4 py-2 rounded-xl font-bold text-sm hover:bg-blue-100 transition-colors flex items-center gap-2 shadow-sm"><Icon name="Archive" size={16}/> Mes Devis</button>
-                                                        <button onClick={handleSaveQuote} className="bg-green-600 text-white px-4 py-2 rounded-xl font-bold text-sm hover:bg-green-700 transition-colors flex items-center gap-2 shadow-lg"><Icon name="Save" size={16}/> Sauvegarder</button>
-                                                    </>
-                                                )}
-                                                <button onClick={generateQuotePDF} className="bg-slate-800 text-white px-4 py-2 rounded-xl font-bold text-sm hover:bg-slate-900 transition-colors flex items-center gap-2 shadow-lg"><Icon name="FileDown" size={16}/> Générer PDF</button>
-                                            </div>
-                                        </div>
-                                        
-                                        <div className="grid gap-4 mb-6">
-                                            <div className="grid gap-1">
-                                                <label className="text-xs font-bold uppercase text-slate-400">Nom du Client / Société</label>
-                                                <input className="w-full p-4 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none font-medium text-lg" placeholder="Ex: Ets Agricole du Sud..." value={quote.client} onChange={e => setQuote({...quote, client: e.target.value})} />
-                                            </div>
-                                        </div>
-
-                                        <div className="bg-slate-50 rounded-2xl border border-slate-100 overflow-hidden">
-                                            <div className="p-4 bg-slate-100 border-b border-slate-200 flex justify-between items-center">
-                                                <h4 className="font-bold text-sm text-slate-600">Articles ({(quote?.items || []).length})</h4>
-                                                <button onClick={openQuoteProductModal} className="text-xs font-bold text-blue-600 bg-white border border-blue-100 px-3 py-1.5 rounded-lg hover:bg-blue-50 transition-colors flex items-center gap-1"><Icon name="Plus" size={14}/> Ajouter Produit</button>
-                                            </div>
-                                            
-                                            {(quote?.items || []).length === 0 ? (
-                                                <div className="p-8 text-center text-slate-400 text-sm">Aucun article ajouté. Commencez par ajouter des produits.</div>
-                                            ) : (
-                                                <div className="divide-y divide-slate-200">
-                                                    {(quote?.items || []).map((item, i) => (
-                                                        item && (
-                                                            <div key={item.id} className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white">
-                                                                <div className="flex-1">
-                                                                    <div className="font-bold text-slate-800 flex items-center gap-2">
-                                                                        {item.name}
-                                                                        {!item.isTaxable ? (<span className="bg-green-100 text-green-700 text-[10px] px-1.5 py-0.5 rounded font-bold uppercase">EXO</span>) : (<span className="bg-slate-100 text-slate-500 text-[10px] px-1.5 py-0.5 rounded font-bold uppercase">TVA 20%</span>)}
-                                                                    </div>
-                                                                    <div className="text-xs text-slate-500">{item.packaging}</div>
-                                                                </div>
-                                                                <div className="flex items-center gap-6">
-                                                                    <div className="text-center"><div className="text-[10px] text-slate-400 uppercase font-bold">Qté</div><div className="font-bold text-slate-700">{item.qty}</div></div>
-                                                                    <div className="text-center"><div className="text-[10px] text-slate-400 uppercase font-bold">P.U.</div><div className="font-bold text-slate-700">{item.basePrice.toFixed(2)}</div></div>
-                                                                    <div className="text-right w-24"><div className="text-[10px] text-slate-400 uppercase font-bold">Total HT</div><div className="font-black text-blue-600">{calculateLineTotal(item).toFixed(2)}</div></div>
-                                                                    <button onClick={() => removeQuoteItem(item.id)} className="text-red-300 hover:text-red-600 transition-colors"><Icon name="Trash2" size={18}/></button>
-                                                                </div>
-                                                            </div>
-                                                        )
-                                                    ))}
-                                                </div>
-                                            )}
-                                            
-                                            {(quote?.items || []).length > 0 && (
-                                                <div className="bg-slate-100 p-4 border-t border-slate-200">
-                                                    <div className="flex justify-end gap-8 text-sm">
-                                                        <div className="text-right">
-                                                            <div className="text-slate-500">Total HT</div>
-                                                            <div className="font-bold text-slate-800 text-lg">
-                                                                {(quote?.items || []).reduce((acc, item) => {
-                                                                    if (!item) return acc; // GUARD
-                                                                    return acc + calculateLineTotal(item);
-                                                                }, 0).toFixed(2)} DH
-                                                            </div>
-                                                        </div>
-                                                        <div className="text-right">
-                                                            <div className="text-slate-500">TTC</div>
-                                                            <div className="font-black text-blue-600 text-xl">
-                                                                {(() => {
-                                                                    let totalHT = 0;
-                                                                    let totalTVA = 0;
-                                                                    (quote?.items || []).forEach(item => {
-                                                                        if (!item) return; // GUARD
-                                                                        const line = calculateLineTotal(item);
-                                                                        totalHT += line;
-                                                                        if(item.isTaxable) totalTVA += line * 0.20;
-                                                                    });
-                                                                    return (totalHT + totalTVA).toFixed(2);
-                                                                })()} DH
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            )}
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
-
-                            {/* ONSSA TAB (NEW) */}
-                            {activeTab === 'onssa' && currentUser.role === 'admin' && (
-                                <div className="max-w-4xl mx-auto space-y-8 animate-fade">
-                                    <div className="bg-white p-8 rounded-3xl shadow-sm border border-slate-200">
-                                        <div className="flex justify-between items-center mb-6">
-                                            <div>
-                                                <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2"><Icon name="ShieldCheck" className="text-green-600"/> Agréments ONSSA (Excel)</h2>
-                                                <p className="text-sm text-slate-500 mt-1">Comparateur de listes officielles pour la veille réglementaire.</p>
-                                                <p className="text-xs text-slate-400 mt-1 italic">Format attendu: Région (A), Province (B), Ville (C), Nom (D), Adresse (E)</p>
-                                            </div>
-                                            {onssaData.report && <button onClick={generateOnssaReportPDF} className="bg-slate-800 text-white px-4 py-2 rounded-xl font-bold text-sm shadow-lg flex items-center gap-2 hover:bg-slate-900"><Icon name="FileDown" size={16}/> Rapport PDF</button>}
-                                        </div>
-
-                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
-                                            {/* ZONE 1: BASE */}
-                                            <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200 flex flex-col items-center text-center">
-                                                <div className="bg-white p-3 rounded-full shadow-sm text-slate-400 mb-3"><Icon name="Database" size={24}/></div>
-                                                <h3 className="font-bold text-slate-700 mb-1">Liste de Base (Excel)</h3>
-                                                <p className="text-xs text-slate-400 mb-4">{onssaData.baseList.length > 0 ? `${onssaData.baseList.length} revendeurs (Date: ${onssaData.baseDate})` : "Aucune liste définie"}</p>
-                                                <button onClick={() => onssaBaseInputRef.current.click()} disabled={isOnssaAnalyzing} className="w-full bg-white border border-slate-300 text-slate-600 py-2 rounded-xl font-bold text-sm hover:bg-slate-100 flex items-center justify-center gap-2"><Icon name="Upload"/> Charger Base (XLSX)</button>
-                                                <input type="file" ref={onssaBaseInputRef} accept=".xlsx, .xls" className="hidden" onChange={(e) => handleOnssaExcel(e, 'base')}/>
-                                            </div>
-
-                                            {/* ZONE 2: NOUVELLE LISTE */}
-                                            <div className="bg-blue-50 p-6 rounded-2xl border border-blue-100 flex flex-col items-center text-center">
-                                                <div className="bg-white p-3 rounded-full shadow-sm text-blue-500 mb-3"><Icon name="RefreshCw" size={24} className={isOnssaAnalyzing ? "animate-spin" : ""}/></div>
-                                                <h3 className="font-bold text-blue-800 mb-1">Nouvelle Liste (Excel)</h3>
-                                                <p className="text-xs text-blue-400 mb-4">{onssaData.newList.length > 0 ? `${onssaData.newList.length} revendeurs (Date: ${onssaData.newDate})` : "En attente de fichier..."}</p>
-                                                <button onClick={() => onssaNewInputRef.current.click()} disabled={isOnssaAnalyzing || onssaData.baseList.length === 0} className="w-full bg-blue-600 text-white py-2 rounded-xl font-bold text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-200"><Icon name="GitCompare"/> Comparer (XLSX)</button>
-                                                <input type="file" ref={onssaNewInputRef} accept=".xlsx, .xls" className="hidden" onChange={(e) => handleOnssaExcel(e, 'new')}/>
-                                            </div>
-                                        </div>
-
-                                        {isOnssaAnalyzing && (
-                                            <div className="bg-slate-900 text-white p-4 rounded-xl mb-6 animate-pulse flex items-center justify-center gap-3">
-                                                <Icon name="Loader2" className="animate-spin"/>
-                                                <span className="font-mono text-sm">{onssaProgress}</span>
-                                            </div>
-                                        )}
-
-                                        {/* RESULTATS COMPARAISON */}
-                                        {onssaData.report && !isOnssaAnalyzing && (
-                                            <div className="animate-fade">
-                                                <div className="flex gap-4 mb-6">
-                                                    <div className="flex-1 bg-green-50 p-4 rounded-xl border border-green-100 flex items-center gap-4">
-                                                        <div className="bg-white p-2 rounded-full text-green-600 shadow-sm"><Icon name="UserPlus" size={24}/></div>
-                                                        <div>
-                                                            <div className="text-2xl font-black text-green-700">{onssaData.report.countAdded}</div>
-                                                            <div className="text-xs font-bold text-green-800 uppercase">Ajoutés</div>
-                                                        </div>
-                                                    </div>
-                                                    <div className="flex-1 bg-red-50 p-4 rounded-xl border border-red-100 flex items-center gap-4">
-                                                        <div className="bg-white p-2 rounded-full text-red-500 shadow-sm"><Icon name="UserMinus" size={24}/></div>
-                                                        <div>
-                                                            <div className="text-2xl font-black text-red-600">{onssaData.report.countRemoved}</div>
-                                                            <div className="text-xs font-bold text-red-800 uppercase">Retirés</div>
-                                                        </div>
-                                                    </div>
-                                                </div>
-
-                                                {/* FILTRE RÉGIONS */}
-                                                <div className="bg-slate-100 p-4 rounded-2xl mb-6 border border-slate-200">
-                                                    <div className="flex justify-between items-center mb-3">
-                                                        <h4 className="font-bold text-slate-700 text-sm flex items-center gap-2"><Icon name="Filter" size={16}/> Filtrer Rapport par Région</h4>
-                                                        <button onClick={toggleAllRegions} className="text-xs text-blue-600 font-bold hover:underline">
-                                                            {selectedRegions.length === availableRegions.length ? "Tout décocher" : "Tout cocher"}
-                                                        </button>
-                                                    </div>
-                                                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 max-h-40 overflow-y-auto custom-scrollbar p-1">
-                                                        {availableRegions.map(reg => (
-                                                            <label key={reg} className="flex items-center gap-2 text-xs bg-white p-2 rounded border border-slate-200 cursor-pointer hover:border-blue-300">
-                                                                <input type="checkbox" checked={selectedRegions.includes(reg)} onChange={() => toggleRegion(reg)} className="rounded text-blue-600 focus:ring-blue-500"/>
-                                                                <span className="truncate" title={reg}>{reg}</span>
-                                                            </label>
-                                                        ))}
-                                                    </div>
-                                                </div>
-
-                                                <div className="space-y-6">
-                                                    {/* We show raw numbers here, PDF will be filtered */}
-                                                    <div className="text-center text-xs text-slate-400 italic mb-4">
-                                                        Les tableaux ci-dessous montrent un aperçu global. Utilisez le bouton "Rapport PDF" pour voir le détail filtré par région.
-                                                    </div>
                                                 </div>
                                             </div>
                                         )}
